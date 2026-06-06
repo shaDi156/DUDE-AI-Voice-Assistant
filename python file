@@ -1,0 +1,294 @@
+import os
+import json
+import wave
+import base64
+import subprocess
+import pyaudio
+from vosk import Model, KaldiRecognizer
+from openai import OpenAI
+
+# This program works like a simple voice assistant:
+# 1. Listen for a wake word.
+# 2. Record the user's spoken question.
+# 3. Convert the speech to text.
+# 4. Ask OpenAI for an answer.
+# 5. Speak the answer back to the user.
+
+# Wake words accepted by the assistant
+WAKE_WORDS = ["hey dude", "hey do", "dude"]
+
+# Audio settings for the microphone input
+RATE = 44100
+CHUNK = 4096
+QUESTION_SECONDS = 8
+
+# File paths used by the program
+WAKE_MODEL_PATH = "vosk-model-small-en-us-0.15"
+QUESTION_FILE = "question.wav"
+ANSWER_FILE = "answer.mp3"
+IMAGE_FILE = "camera.jpg"
+
+# Create the OpenAI client using the API key stored in your environment
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+# Stop the program early if the API key is missing
+if not os.environ.get("OPENAI_API_KEY"):
+    print("Missing OPENAI_API_KEY")
+    print('Run: export OPENAI_API_KEY="your_api_key_here"')
+    exit(1)
+
+# PyAudio controls the microphone stream
+p = pyaudio.PyAudio()
+
+
+def speak(text):
+    """
+    Convert text to speech and play it through the speaker.
+    """
+    print("Dude:", text)
+
+    # Ask OpenAI to turn the answer text into an audio file
+    speech = client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=text
+    )
+
+    # Save the generated speech audio as an MP3 file
+    speech.write_to_file(ANSWER_FILE)
+
+    # Play the MP3 file through the speaker using mpg123
+    subprocess.run(["mpg123", ANSWER_FILE])
+
+
+def listen_for_wake_word():
+    """
+    Keep listening until the assistant hears 'hey dude'.
+    """
+    print("Listening for wake word: hey dude")
+
+    # Load the offline Vosk speech recognition model
+    model = Model(WAKE_MODEL_PATH)
+    recognizer = KaldiRecognizer(model, RATE)
+
+    # Open a live microphone stream
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=RATE,
+        input=True,
+        frames_per_buffer=CHUNK
+    )
+
+    while True:
+        # Read a small chunk of microphone audio
+        data = stream.read(CHUNK, exception_on_overflow=False)
+
+        # Vosk returns True when it has enough audio to recognize words
+        if recognizer.AcceptWaveform(data):
+            result = json.loads(recognizer.Result())
+            text = result.get("text", "").lower()
+
+            print("Heard:", text)
+
+            # If any wake word appears in the recognized text, activate the assistant
+            if any(word in text for word in WAKE_WORDS):
+                print("Wake word detected!")
+                break
+
+    # Close the microphone stream after the wake word is detected
+    stream.stop_stream()
+    stream.close()
+
+
+def record_question():
+    """
+    Record the user's voice question for fixed seconds.
+    """
+    print("Ask your question now...")
+
+    # Open the microphone again to record the question
+    stream = p.open(
+        format=pyaudio.paInt16,
+        channels=1,
+        rate=RATE,
+        input=True,
+        frames_per_buffer=CHUNK
+    )
+
+    frames = []
+
+    # Keep reading audio chunks until QUESTION_SECONDS has passed
+    for _ in range(int(RATE / CHUNK * QUESTION_SECONDS)):
+        frames.append(
+            stream.read(CHUNK, exception_on_overflow=False)
+        )
+
+    stream.stop_stream()
+    stream.close()
+
+    # Save the recorded audio chunks into a WAV file
+    with wave.open(QUESTION_FILE, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+        wf.setframerate(RATE)
+        wf.writeframes(b"".join(frames))
+
+    print("Question recorded.")
+
+
+def speech_to_text():
+    """
+    Send recorded audio to OpenAI and convert speech to text.
+    """
+    print("Transcribing...")
+
+    # Send the recorded WAV file to OpenAI's transcription model
+    with open(QUESTION_FILE, "rb") as audio:
+        transcript = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=audio
+        )
+
+    # Clean up the text returned by the transcription model
+    text = transcript.text.strip()
+
+    print("You said:", text)
+
+    # Lowercase the text so command checks are easier
+    return text.lower()
+
+
+def ask_openai(text):
+    """
+    Send normal text question to OpenAI and get answer.
+    """
+    print("Thinking...")
+
+    # Send the user's question to OpenAI and ask for a short assistant-style reply
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=(
+            "You are Dude, a helpful Raspberry Pi voice assistant. "
+            "Reply briefly and clearly. "
+            f"User said: {text}"
+        )
+    )
+
+    # Extract only the final text answer from the response
+    answer = response.output_text.strip()
+
+    return answer
+
+
+def take_picture():
+    """
+    Capture image using Raspberry Pi camera.
+    """
+    print("Taking picture...")
+
+    # Run the Raspberry Pi camera command and save the photo to IMAGE_FILE
+    subprocess.run([
+        "rpicam-still",
+        "-n",
+        "-o",
+        IMAGE_FILE
+    ])
+
+    print("Picture saved as camera.jpg")
+
+
+def analyze_image(question):
+    """
+    Send captured image and user's question to OpenAI Vision.
+    """
+    print("Analyzing image...")
+
+    # Read the saved image and convert it to base64 so it can be sent to OpenAI
+    with open(IMAGE_FILE, "rb") as img:
+        base64_image = base64.b64encode(img.read()).decode("utf-8")
+
+    # Send both the user's question and the camera image to OpenAI
+    response = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": question
+                    },
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/jpeg;base64,{base64_image}"
+                    }
+                ]
+            }
+        ]
+    )
+
+    # Extract the text answer about the image
+    answer = response.output_text.strip()
+
+    return answer
+
+
+try:
+    # Outer loop: wait for the wake word again after going back to sleep
+    while True:
+        listen_for_wake_word()
+
+        speak("Assistant activated. Say stop listening to exit.")
+
+        # camera_mode remembers whether the camera has been opened
+        camera_mode = False
+
+        # Inner loop: keep answering questions until the user says "stop listening"
+        while True:
+            record_question()
+
+            user_text = speech_to_text()
+
+            # If transcription found no words, listen again
+            if not user_text:
+                print("No speech detected.")
+                continue
+
+            # Return to wake-word mode
+            if "stop listening" in user_text:
+                speak("Going back to sleep.")
+                break
+
+            # Take a picture and switch into image-question mode
+            if "open camera" in user_text:
+                take_picture()
+                camera_mode = True
+                speak("Camera opened. Ask me what you see.")
+                continue
+
+            # If the camera is active, answer questions using the captured image
+            if camera_mode:
+                answer = analyze_image(user_text)
+                speak(answer)
+                continue
+
+            # Normal voice-assistant question without the camera
+            answer = ask_openai(user_text)
+            speak(answer)
+
+except KeyboardInterrupt:
+    # Ctrl+C stops the program cleanly
+    print("\nStopped by user.")
+
+finally:
+    # Release the microphone resources before the program exits
+    p.terminate()
+
+
+
+
+
+
+
+ 
